@@ -568,7 +568,7 @@ def emd2(a, b, M, processes=1,
     return res
 
 
-def free_support_barycenter(measures_locations, measures_weights, X_init, b=None, weights=None, numItermax=100,
+def free_support_barycenter(measure_locations, measure_weights, X_init, method='fixed-point', b=None, weights=None, numItermax=100,
                             stopThr=1e-7, verbose=False, log=None, numThreads=1):
     r"""
     Solves the free support (locations of the barycenters are optimized, not the weights) Wasserstein barycenter problem (i.e. the weighted Frechet mean for the 2-Wasserstein distance), formally:
@@ -583,8 +583,10 @@ def free_support_barycenter(measures_locations, measures_weights, X_init, b=None
     - `measures_locations` denotes the :math:`\mathbf{X}_i \in \mathbb{R}^{k_i, d}`: empirical measures atoms locations
     - :math:`\mathbf{b} \in \mathbb{R}^{k}` is the desired weights vector of the barycenter
 
-    This problem is considered in :ref:`[20] <references-free-support-barycenter>` (Algorithm 2).
-    There are two differences with the following codes:
+    We provide two solvers to this problem:
+
+    First, the fixed-point approach implements :ref:`[20] <references-free-support-barycenter>` (Algorithm 2).
+    There are two differences with the following code:
 
     - we do not optimize over the weights
     - we do not do line search for the locations updates, we use i.e. :math:`\theta = 1` in
@@ -592,17 +594,21 @@ def free_support_barycenter(measures_locations, measures_weights, X_init, b=None
       implementation of the fixed-point algorithm of
       :ref:`[43] <references-free-support-barycenter>` proposed in the continuous setting.
 
+    Secondly, the Block Coordinate Descent method alternates optimisation in the transport plans and in the positions.
+
     Parameters
     ----------
-    measures_locations : list of N (k_i,d) array-like
+    measure_locations : list of N (k_i,d) array-like
         The discrete support of a measure supported on :math:`k_i` locations of a `d`-dimensional space
         (:math:`k_i` can be different for each element of the list)
-    measures_weights : list of N (k_i,) array-like
+    measure_weights : list of N (k_i,) array-like
         Numpy arrays where each numpy array has :math:`k_i` non-negatives values summing to one
         representing the weights of each discrete input measure
 
     X_init : (k,d) array-like
         Initialization of the support locations (on `k` atoms) of the barycenter
+    method : 'fixed-point' or 'BCD'
+        Chooses the optimisation method
     b : (k,) array-like
         Initialization of the weights of the barycenter (non-negatives, sum to 1)
     weights : (N,) array-like
@@ -635,12 +641,12 @@ def free_support_barycenter(measures_locations, measures_weights, X_init, b=None
     .. [43] Álvarez-Esteban, Pedro C., et al. "A fixed-point approach to barycenters in Wasserstein space." Journal of Mathematical Analysis and Applications 441.2 (2016): 744-762.
 
     """
-
-    nx = get_backend(*measures_locations, *measures_weights, X_init)
+    assert method in ['fixed-point', 'BCD'], '"{}" is not a valid method for free_support_barycenter'.format(method)
+    nx = get_backend(*measure_locations, *measure_weights, X_init)
 
     iter_count = 0
 
-    N = len(measures_locations)
+    N = len(measure_locations)
     k = X_init.shape[0]
     d = X_init.shape[1]
     if b is None:
@@ -655,25 +661,59 @@ def free_support_barycenter(measures_locations, measures_weights, X_init, b=None
 
     displacement_square_norm = stopThr + 1.
 
-    while (displacement_square_norm > stopThr and iter_count < numItermax):
+    if method == 'fixed-point':
 
-        T_sum = nx.zeros((k, d), type_as=X_init)
+        while displacement_square_norm > stopThr and iter_count < numItermax:
 
-        for (measure_locations_i, measure_weights_i, weight_i) in zip(measures_locations, measures_weights, weights):
-            M_i = dist(X, measure_locations_i)
-            T_i = emd(b, measure_weights_i, M_i, numThreads=numThreads)
-            T_sum = T_sum + weight_i * 1. / b[:, None] * nx.dot(T_i, measure_locations_i)
+            T_sum = nx.zeros((k, d), type_as=X_init)
 
-        displacement_square_norm = nx.sum((T_sum - X) ** 2)
-        if log:
-            displacement_square_norms.append(displacement_square_norm)
+            for (measure_locations_i, measure_weights_i, weight_i) in zip(measure_locations, measure_weights, weights):
+                M_i = dist(X, measure_locations_i)
+                T_i = emd(b, measure_weights_i, M_i, numThreads=numThreads)
+                T_sum = T_sum + weight_i * 1. / b[:, None] * nx.dot(T_i, measure_locations_i)
 
-        X = T_sum
+            displacement_square_norm = nx.sum((T_sum - X) ** 2)
+            if log:
+                displacement_square_norms.append(displacement_square_norm)
 
-        if verbose:
-            print('iteration %d, displacement_square_norm=%f\n', iter_count, displacement_square_norm)
+            X = T_sum
 
-        iter_count += 1
+            if verbose:
+                print('iteration %d, displacement_square_norm=%f\n', iter_count, displacement_square_norm)
+
+            iter_count += 1
+
+    else:  # BCD method
+        pi_list = [None for _ in range(N)]
+
+        while displacement_square_norm > stopThr and iter_count < numItermax:
+
+            T = nx.zeros((k, d), type_as=X)
+
+            # transport plan updates
+            for i in range(N):
+                M = dist(measure_locations[i], X)
+                pi_list[i] = emd(measure_weights[i], b, M)
+
+            # barycenter position updates
+            for i in range(k):
+                B = nx.zeros((d, d))
+                c = nx.zeros(d)
+                for j in range(N):
+                    B += weights[j] * pi_list[j][:, i].sum()
+                    c += weights[j] * pi_list[j][:, i].T @ measure_locations[j]
+                T[i, :] = np.linalg.solve(B, c)  # y_l = B_l^{-1} c_l
+
+            displacement_square_norm = nx.sum((T - X) ** 2)
+            if log:
+                displacement_square_norms.append(displacement_square_norm)
+
+            X = T
+
+            if verbose:
+                print('iteration %d, displacement_square_norm=%f\n', iter_count, displacement_square_norm)
+
+            iter_count += 1
 
     if log:
         log_dict['displacement_square_norms'] = displacement_square_norms

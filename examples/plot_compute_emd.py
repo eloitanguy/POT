@@ -4,7 +4,7 @@
 OT distances in 1D
 ==================
 
-Shows how to compute multiple Wassersein and Sinkhorn with two different
+Shows how to compute multiple Wasserstein and Sinkhorn with two different
 ground metrics and plot their values for different distributions.
 
 
